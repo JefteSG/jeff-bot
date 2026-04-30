@@ -132,7 +132,7 @@ Crie os três secrets abaixo:
 ## Etapa 7 — Testar o deploy automático
 
 Faça qualquer alteração no código e faça push para a branch `main`:
-
+teste
 ```bash
 git add .
 git commit -m "test: primeiro deploy automático"
