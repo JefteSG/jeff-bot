@@ -10,6 +10,7 @@ COPY requirements.txt ./
 RUN pip install --upgrade pip && \
     pip install --no-deps selfcord.py==1.0.3 && \
     pip install --no-cache-dir -r requirements.txt && \
+    pip install --force-reinstall --no-deps discord.py-self==2.1.0 && \
     pip install discord.py==2.1.0
 
 COPY . .

@@ -73,11 +73,26 @@ class LLMReply:
     tool_calls: list[dict[str, Any]]
 
 
-def _request_payload(user_message: str, history: list[dict[str, str]]) -> dict[str, Any]:
+def _request_payload(
+    user_message: str,
+    history: list[dict[str, str]],
+    image_urls: list[str] | None = None,
+) -> dict[str, Any]:
     settings = get_settings()
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history)
-    messages.append({"role": "user", "content": user_message})
+
+    if image_urls and settings.vision_enabled:
+        content: list[dict[str, Any]] = [{"type": "text", "text": user_message}]
+        for url in image_urls:
+            content.append({"type": "image_url", "image_url": {"url": url}})
+        messages.append({"role": "user", "content": content})
+    else:
+        text = user_message
+        if image_urls:
+            text = f"{user_message}\n[{len(image_urls)} print(s) de erro anexado(s) — visão desabilitada]"
+        messages.append({"role": "user", "content": text})
+
     return {
         "model": settings.deepseek_model,
         "messages": messages,
@@ -96,13 +111,17 @@ def _fallback_reply(user_message: str) -> LLMReply:
     return LLMReply(text=text, confidence_score=0.55, tool_calls=[])
 
 
-def generate_reply(user_message: str, history: list[dict[str, str]] | None = None) -> LLMReply:
+def generate_reply(
+    user_message: str,
+    history: list[dict[str, str]] | None = None,
+    image_urls: list[str] | None = None,
+) -> LLMReply:
     """Integração DeepSeek em formato compatível OpenAI Chat Completions."""
     settings = get_settings()
     if not settings.deepseek_api_key:
         return _fallback_reply(user_message)
 
-    payload = _request_payload(user_message, history or [])
+    payload = _request_payload(user_message, history or [], image_urls)
     url = f"{settings.deepseek_base_url.rstrip('/')}/chat/completions"
     req = request.Request(
         url=url,
@@ -148,7 +167,7 @@ def ask_error_triage_question(history_size: int) -> str:
     return questions[idx]
 
 
-def generate_error_diagnosis(history: list[str]) -> LLMReply:
+def generate_error_diagnosis(history: list[str], image_urls: list[str] | None = None) -> LLMReply:
     joined = "\n".join(history[-6:])
     base = "Hipótese inicial: regressão após alteração recente ou configuração de ambiente."
     if "timeout" in joined.lower():
@@ -160,4 +179,8 @@ def generate_error_diagnosis(history: list[str]) -> LLMReply:
         f"{base} Próximo passo: validar logs do serviço dependente e confirmar credenciais ativas. "
         "Se quiser, eu já monto checklist de correção."
     )
+    if image_urls:
+        llm_with_image = generate_reply("\n".join(history[-6:]), image_urls=image_urls)
+        if llm_with_image.text:
+            return llm_with_image
     return LLMReply(text=reply, confidence_score=0.74, tool_calls=[])

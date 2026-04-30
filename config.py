@@ -32,6 +32,8 @@ class Settings:
     auto_reply_delay_minutes: int = int(os.getenv("AUTO_REPLY_DELAY_MINUTES", "5"))
     watchdog_poll_seconds: int = int(os.getenv("WATCHDOG_POLL_SECONDS", "30"))
     auto_reply_enabled: bool = os.getenv("AUTO_REPLY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    # Habilita envio de imagens para o LLM (requer modelo com suporte a visão, ex: gpt-4o)
+    vision_enabled: bool = os.getenv("VISION_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     print(f"Settings loaded: app_env={app_env}, sqlite_path={sqlite_path}, "
           f"discord_user_token={'***' if discord_user_token else '(none)'}, "
           f"discord_bot_token={'***' if discord_bot_token else '(none)'}, "

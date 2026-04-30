@@ -110,6 +110,7 @@ async def approve_message(queue_id: int, payload: ApprovalActionPayload) -> dict
     # Etapa 1: aprovação pré-IA -> gera sugestão e mantém na fila para segunda aprovação.
     if bool(meta.get("pre_ai")):
         sender_id = int(row["sender_id"])
+        image_urls = [str(u) for u in (meta.get("image_urls") or []) if u]
         history = _recent_sender_history(sender_id)
         # Adiciona system prompt ao início do contexto
         system_prompt = {
@@ -144,7 +145,7 @@ async def approve_message(queue_id: int, payload: ApprovalActionPayload) -> dict
             )
         }
         history.insert(0, system_prompt)
-        llm_reply = await asyncio.to_thread(generate_reply, str(row["original_msg"]), history)
+        llm_reply = await asyncio.to_thread(generate_reply, str(row["original_msg"]), history, image_urls or None)
 
         meta["pre_ai"] = False
         meta["approved_for_ai"] = True

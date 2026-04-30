@@ -263,6 +263,12 @@ async def _handle_bot_dm(message: discord.Message) -> None:
     finally:
         await conn.close()
 
+    image_urls = [
+        str(att.url)
+        for att in message.attachments
+        if str(getattr(att, "content_type", "") or "").lower().startswith("image/")
+    ]
+
     reason = _needs_human_reason(content)
     if reason:
         await _queue_needs_human(
@@ -284,7 +290,7 @@ async def _handle_bot_dm(message: discord.Message) -> None:
         return
 
     prompt = _bot_dm_prompt(content, sender_global_name, sender_username)
-    llm_reply = await asyncio.to_thread(generate_reply, prompt, history)
+    llm_reply = await asyncio.to_thread(generate_reply, prompt, history, image_urls or None)
     reply_text = llm_reply.text.strip() or "me manda mais um pouco de contexto"
 
     await message.channel.send(reply_text)

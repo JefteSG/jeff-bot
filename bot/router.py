@@ -388,6 +388,7 @@ async def _route_core(
     sender_discord_id = str(payload.get("sender_discord_id") or "")
     sender_name = str(payload.get("sender_name") or "")
     content = str(payload.get("content") or "").strip()
+    image_urls: list[str] = [str(u) for u in (payload.get("image_urls") or []) if u]
 
     if not sender_discord_id or not content:
         return {"action": "ignored", "intent": "unknown"}
@@ -433,7 +434,10 @@ async def _route_core(
                         await _append_context(conn, sender_id, role="assistant", intent=intent, message=answer)
                         return {"action": "replied", "intent": intent, "source": "knowledge_base"}
 
-                llm_reply = await asyncio.to_thread(generate_reply, content, history)
+                llm_reply = await asyncio.to_thread(generate_reply, content, history, image_urls or None)
+                meta: dict[str, Any] = {"source": "llm_suggestion"}
+                if image_urls:
+                    meta["image_urls"] = image_urls
                 await _enqueue_pending(
                     conn,
                     sender_id=sender_id,
@@ -441,7 +445,7 @@ async def _route_core(
                     original_msg=content,
                     suggested_reply=llm_reply.text,
                     confidence_score=llm_reply.confidence_score,
-                    meta={"source": "llm_suggestion"},
+                    meta=meta,
                 )
                 return {"action": "queued", "intent": intent}
             except Exception as exc:
@@ -487,7 +491,12 @@ async def _route_core(
                     await _append_context(conn, sender_id, role="assistant", intent=intent, message=question)
                     return {"action": "replied", "intent": intent, "phase": "triage"}
 
-                diagnosis_reply = await asyncio.to_thread(generate_error_diagnosis, error_history + [content])
+                diagnosis_reply = await asyncio.to_thread(
+                    generate_error_diagnosis, error_history + [content], image_urls or None
+                )
+                diag_meta: dict[str, Any] = {"phase": "diagnosis"}
+                if image_urls:
+                    diag_meta["image_urls"] = image_urls
                 await _enqueue_pending(
                     conn,
                     sender_id=sender_id,
@@ -495,7 +504,7 @@ async def _route_core(
                     original_msg=content,
                     suggested_reply=diagnosis_reply.text,
                     confidence_score=diagnosis_reply.confidence_score,
-                    meta={"phase": "diagnosis"},
+                    meta=diag_meta,
                 )
                 await _append_context(conn, sender_id, role="assistant", intent=intent, message=diagnosis_reply.text)
                 return {"action": "queued", "intent": intent, "phase": "diagnosis"}
@@ -673,18 +682,27 @@ async def route_message(message: Message, client: Client) -> None:
         return ""
 
     author = getattr(message, "author", None)
-    # Tenta pegar global_name, se não existir, usa name
     sender_name = ""
     if author is not None:
         sender_name = getattr(author, "global_name", None)
         if not sender_name:
             sender_name = getattr(author, "name", "")
+
+    attachments = getattr(message, "attachments", None) or []
+    image_urls_from_msg = [
+        str(getattr(att, "url", "") or "")
+        for att in attachments
+        if str(getattr(att, "content_type", "") or "").lower().startswith("image/")
+        and str(getattr(att, "url", "") or "")
+    ]
+
     payload = {
         "sender_discord_id": str(getattr(author, "id", "")),
         "sender_name": str(sender_name),
         "content": str(getattr(message, "content", "")),
         "channel_id": _channel_id(message),
         "message_id": _message_id(message),
+        "image_urls": image_urls_from_msg,
     }
 
     client_user = getattr(client, "user", None)
@@ -733,23 +751,28 @@ async def record_incoming_message(payload: dict[str, str]) -> dict[str, Any]:
     if not sender_discord_id or not content:
         return {"action": "ignored", "reason": "invalid_payload"}
 
+    image_urls = [str(u) for u in (payload.get("image_urls") or []) if u]
+
     conn = await _connect()
     try:
         sender = await _ensure_sender(conn, sender_discord_id, sender_name)
         sender_id = int(sender["id"])
 
         await _append_context(conn, sender_id, role="user", intent="unknown", message=content)
+        watch_meta: dict[str, Any] = {
+            "source": "discord_listener",
+            "sender_discord_id": sender_discord_id,
+            "sender_name": sender_name,
+        }
+        if image_urls:
+            watch_meta["image_urls"] = image_urls
         await _upsert_conversation_watch(
             conn,
             sender_id=sender_id,
             content=content,
             channel_id=channel_id or f"sender:{sender_discord_id}",
             message_id=message_id,
-            meta={
-                "source": "discord_listener",
-                "sender_discord_id": sender_discord_id,
-                "sender_name": sender_name,
-            },
+            meta=watch_meta,
         )
         return {"action": "watching", "sender_id": sender_id}
     finally:

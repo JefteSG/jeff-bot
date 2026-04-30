@@ -189,7 +189,15 @@ async def _try_auto_reply(watch: dict[str, Any]) -> bool:
 
     sender_name = str(watch.get("display_name") or "").strip()
     prompt = _auto_reply_prompt(message, sender_name)
-    llm_reply = await asyncio.to_thread(generate_reply, prompt, [])
+
+    raw_meta = str(watch.get("meta_json") or "")
+    try:
+        watch_meta = json.loads(raw_meta) if raw_meta else {}
+    except json.JSONDecodeError:
+        watch_meta = {}
+    image_urls = [str(u) for u in (watch_meta.get("image_urls") or []) if u]
+
+    llm_reply = await asyncio.to_thread(generate_reply, prompt, [], image_urls or None)
     reply_text = llm_reply.text.strip()
     if not reply_text:
         watch["auto_reply_blocked_reason"] = "LLM sem resposta"
