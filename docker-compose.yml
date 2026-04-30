@@ -1,0 +1,41 @@
+version: '3.9'
+
+services:
+  api:
+    build: .
+    image: jeff-bot:latest
+    container_name: jeff-bot-api
+    env_file:
+      - .env
+    volumes:
+      - ./db:/app/db
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  bot:
+    image: jeff-bot:latest
+    container_name: jeff-bot-bot
+    env_file:
+      - .env
+    volumes:
+      - ./db:/app/db
+    command: ["python", "-m", "bot.main"]
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    container_name: jeff-bot-ui
+    working_dir: /app
+    volumes:
+      - ./ui:/app
+    ports:
+      - "5173:5173"
+    command: ["npm", "run", "dev"]
+    restart: unless-stopped
+    depends_on:
+      - api
