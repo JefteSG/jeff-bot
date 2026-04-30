@@ -13,7 +13,6 @@ cffi==2.0.0
 charset-normalizer==3.4.7
 click==8.3.3
 curl_cffi==0.15.0
-discord-protos==0.0.2
 discord.py-self==2.1.0
 fastapi==0.115.0
 frozenlist==1.8.0

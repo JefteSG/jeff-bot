@@ -68,11 +68,9 @@ def register_listeners(client: Any) -> None:
     async def _on_message(message: Any) -> None:
         reason = _reject_reason(message, client)
         if reason:
-            print(f"[listener] descartada: {reason}")
             return
 
         msg_author = getattr(message, "author", None)
-        print(f'objeto dict completo: {message}')
         print(f"[listener] mensagem recebida de {getattr(msg_author, 'id', 'unknown')}")
         await handle_incoming_message(message, client)
 
