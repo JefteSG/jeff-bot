@@ -30,12 +30,9 @@ services:
       context: ./ui
       dockerfile: Dockerfile
     container_name: jeff-bot-ui
-    working_dir: /app
-    volumes:
-      - ./ui:/app
     ports:
       - "5173:5173"
-    command: ["npm", "run", "dev"]
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
     restart: unless-stopped
     depends_on:
       - api

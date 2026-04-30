@@ -9,7 +9,8 @@ COPY requirements.txt ./
 # selfcord.py==1.0.3 precisa de --no-deps para evitar aiohttp==3.8.5, incompatível com Python 3.12
 RUN pip install --upgrade pip && \
     pip install --no-deps selfcord.py==1.0.3 && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install discord.py==2.1.0
 
 COPY . .
 
