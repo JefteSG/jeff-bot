@@ -34,6 +34,10 @@ class Settings:
     auto_reply_enabled: bool = os.getenv("AUTO_REPLY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     # Habilita envio de imagens para o LLM (requer modelo com suporte a visão, ex: gpt-4o)
     vision_enabled: bool = os.getenv("VISION_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    # Usa o SDK openai-agents (Agent + Runner + SQLiteSession) no bot oficial
+    use_agents_sdk: bool = os.getenv("USE_AGENTS_SDK", "false").lower() in {"1", "true", "yes", "on"}
+    # Desativa envio de traces para a API da OpenAI (recomendado ao usar DeepSeek)
+    agents_tracing_disabled: bool = os.getenv("AGENTS_TRACING_DISABLED", "true").lower() in {"1", "true", "yes", "on"}
     print(f"Settings loaded: app_env={app_env}, sqlite_path={sqlite_path}, "
           f"discord_user_token={'***' if discord_user_token else '(none)'}, "
           f"discord_bot_token={'***' if discord_bot_token else '(none)'}, "

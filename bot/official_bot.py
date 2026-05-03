@@ -10,6 +10,11 @@ from api.services.llm import LLMReply, generate_reply
 from config import get_settings
 
 try:
+    from agent_sdk import run_agent_reply
+except ModuleNotFoundError:
+    from bot.agent_sdk import run_agent_reply
+
+try:
     from watchdog import SENSITIVE_HINTS
     from router import _append_context, _connect, _enqueue_pending, _ensure_sender
 except ModuleNotFoundError:
@@ -290,8 +295,18 @@ async def _handle_bot_dm(message: discord.Message) -> None:
         return
 
     prompt = _bot_dm_prompt(content, sender_global_name, sender_username)
-    llm_reply = await asyncio.to_thread(generate_reply, prompt, history, image_urls or None)
-    reply_text = llm_reply.text.strip() or "me manda mais um pouco de contexto"
+    settings = get_settings()
+    if settings.use_agents_sdk:
+        # Usa Agent + Runner + SQLiteSession: o histórico é gerenciado automaticamente.
+        # O session_id é o discord_id do remetente para persistir entre reinicializações.
+        reply_text = await run_agent_reply(
+            user_message=prompt,
+            session_id=sender_discord_id,
+            image_urls=image_urls or None,
+        )
+    else:
+        llm_reply = await asyncio.to_thread(generate_reply, prompt, history, image_urls or None)
+        reply_text = llm_reply.text.strip() or "me manda mais um pouco de contexto"
 
     await message.channel.send(reply_text)
 
