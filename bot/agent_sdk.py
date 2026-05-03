@@ -239,7 +239,7 @@ def _build_provider() -> OpenAIProvider:
     )
 
 
-def _build_agent() -> Agent:  # type: ignore[type-arg]
+def _build_agent() -> Agent[None]:
     """Cria o Agent com instruções de sistema e ferramentas registradas."""
     settings = get_settings()
     return Agent(
