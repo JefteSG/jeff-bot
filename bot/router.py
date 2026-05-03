@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 import aiosqlite
 
+from api.services.discord_outbound import notify_jeff, send_via_userbot
 from api.services.llm import ask_error_triage_question, generate_error_diagnosis, generate_reply
 from api.services.notion import create_task_card
 from config import get_settings
@@ -18,6 +19,84 @@ if TYPE_CHECKING:
 
 INTENTS = {"routine_question", "error_report", "task_request", "greeting", "unknown"}
 CONTEXT_WINDOW_MINUTES = 3
+
+WANTS_JEFF_HINTS = (
+    "avisa o jeff",
+    "avisa jeff",
+    "chama o jeff",
+    "chama jeff",
+    "fala com o jeff",
+    "fala pro jeff",
+    "preciso do jeff",
+    "quero falar com o jeff",
+    "pode chamar o jeff",
+    "só o jeff",
+    "so o jeff",
+    "jeff que sabe",
+    "jeff precisa ver",
+    "deixa eu falar com o jeff",
+    "quero o jeff",
+)
+
+URGENCY_HINTS = (
+    "urgente",
+    "é urgente",
+    "é urgencia",
+    "urgência",
+    "urgencia",
+    "emergência",
+    "emergencia",
+    "crítico",
+    "critico",
+    "fora do ar",
+    "caindo",
+    "caiu",
+    "travado",
+    "travou",
+    "quebrado",
+    "quebrou",
+    "não funciona",
+    "nao funciona",
+    "parou de funcionar",
+    "perdendo dinheiro",
+    "cliente reclamando",
+    "produção caiu",
+    "producao caiu",
+    "site fora",
+    "sistema fora",
+    "preciso agora",
+    "precisa agora",
+    "não pode esperar",
+    "nao pode esperar",
+    "o mais rapido",
+    "o mais rápido",
+    "socorro",
+    "agora",
+    "asap",
+    "rapidão",
+    "rapidao",
+    "já",
+    "ja",
+)
+
+
+def _is_wants_jeff(text: str) -> bool:
+    lower = text.lower()
+    normalized = " " + lower.replace("\n", " ").strip() + " "
+    for hint in WANTS_JEFF_HINTS:
+        if hint in normalized:
+            return True
+    return False
+
+
+def _is_urgent(text: str) -> bool:
+    lower = text.lower()
+    # Tira espaços extras e normaliza
+    normalized = " " + lower.replace("\n", " ").strip() + " "
+    for hint in URGENCY_HINTS:
+        if hint in normalized:
+            return True
+    return False
 
 
 def _sqlite_path() -> Path:
@@ -740,6 +819,35 @@ async def route_payload(payload: dict[str, str]) -> dict[str, Any]:
     return await _route_core(payload, send_reply=None)
 
 
+async def _open_jeff_relay(conn: aiosqlite.Connection, sender_id: int, user_channel_id: str, context_msg: str, trigger: str) -> None:
+    """Registra relay pendente Jeff → usuário, ignorando se já existe um aberto."""
+    existing = await conn.execute_fetchall(
+        "SELECT id FROM jeff_relays WHERE sender_id = ? AND status = 'waiting' LIMIT 1",
+        (sender_id,),
+    )
+    if existing:
+        return
+    await conn.execute(
+        "INSERT INTO jeff_relays (sender_id, user_channel_id, status, trigger, context_msg) VALUES (?, ?, 'waiting', ?, ?)",
+        (sender_id, user_channel_id, trigger, context_msg),
+    )
+    await conn.commit()
+
+
+async def _has_recent_notification(conn: aiosqlite.Connection, sender_id: int) -> bool:
+    """Verifica se já notificamos Jeff sobre este sender nos últimos 2 minutos para evitar duplicação."""
+    row = await conn.execute_fetchone(
+        """
+        SELECT id FROM jeff_relays
+        WHERE sender_id = ? AND status = 'waiting'
+        AND created_at >= datetime('now', '-2 minutes')
+        LIMIT 1
+        """,
+        (sender_id,),
+    )
+    return bool(row)
+
+
 async def record_incoming_message(payload: dict[str, str]) -> dict[str, Any]:
     """Registra mensagem recebida sem chamar IA nem abrir fila imediata."""
     sender_discord_id = str(payload.get("sender_discord_id") or "")
@@ -752,6 +860,7 @@ async def record_incoming_message(payload: dict[str, str]) -> dict[str, Any]:
         return {"action": "ignored", "reason": "invalid_payload"}
 
     image_urls = [str(u) for u in (payload.get("image_urls") or []) if u]
+    effective_channel = channel_id or f"sender:{sender_discord_id}"
 
     conn = await _connect()
     try:
@@ -770,13 +879,65 @@ async def record_incoming_message(payload: dict[str, str]) -> dict[str, Any]:
             conn,
             sender_id=sender_id,
             content=content,
-            channel_id=channel_id or f"sender:{sender_discord_id}",
+            channel_id=effective_channel,
             message_id=message_id,
             meta=watch_meta,
         )
+
+        # Detecção imediata: pessoa pediu pra chamar o Jeff OU mensagem é urgente.
+        wants_jeff = _is_wants_jeff(content)
+        urgent = _is_urgent(content)
+        print(f"[router] análise da mensagem: wants_jeff={wants_jeff}, urgent={urgent}, sender={sender_discord_id}")
+        if (wants_jeff or urgent) and effective_channel:
+            trigger = "user_request" if wants_jeff else "urgency"
+            await _open_jeff_relay(conn, sender_id, effective_channel, content, trigger)
+            reply_text = "Vou chamar o Jeff agora!" if wants_jeff else "Entendido, vou avisar o Jeff que é urgente!"
+            await _append_context(conn, sender_id, role="assistant", intent="unknown", message=reply_text)
+
+            # Verifica deduplicação antes de notificar
+            already_notified = await _has_recent_notification(conn, sender_id)
+            if already_notified:
+                print(f"[router] notificação recente já existe para este sender, ignorando duplicata")
+                return {"action": "jeff_called", "trigger": trigger, "sender_id": sender_id, "deduplicated": True}
+
+            print(f"[router] notificando Jeff — trigger={trigger}, sender={sender_discord_id}")
+            asyncio.create_task(_notify_jeff_background(
+                sender_name=sender_name,
+                content=content,
+                channel_id=effective_channel,
+                reply_text=reply_text,
+                trigger=trigger,
+            ))
+            return {"action": "jeff_called", "trigger": trigger, "sender_id": sender_id}
+
         return {"action": "watching", "sender_id": sender_id}
     finally:
         await conn.close()
+
+
+async def _notify_jeff_background(
+    sender_name: str,
+    content: str,
+    channel_id: str,
+    reply_text: str,
+    trigger: str = "user_request",
+) -> None:
+    """Envia resposta ao usuário e notifica Jeff em background."""
+    try:
+        result = await asyncio.to_thread(send_via_userbot, channel_id, reply_text)
+        if not result.success:
+            print(f"[router] falha ao responder usuario (jeff_call): {result.error}")
+    except Exception as exc:
+        print(f"[router] erro ao responder usuario (jeff_call): {exc}")
+
+    try:
+        result = await asyncio.to_thread(notify_jeff, sender_name, content, trigger, "")
+        if result.success:
+            print(f"[router] Jeff notificado com sucesso — trigger={trigger}, sender={sender_name}")
+        else:
+            print(f"[router] FALHA ao notificar Jeff — trigger={trigger}, erro={result.error}")
+    except Exception as exc:
+        print(f"[router] erro inesperado ao notificar Jeff: {exc}")
 
 
 async def record_jeff_reply(payload: dict[str, str]) -> dict[str, Any]:

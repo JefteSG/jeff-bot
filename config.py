@@ -19,6 +19,7 @@ class Settings:
     discord_user_token: str = os.getenv("DISCORD_USER_TOKEN", os.getenv("DISCORD_TOKEN", ""))
     discord_bot_token: str = os.getenv("DISCORD_BOT_TOKEN", "")
     discord_command_prefix: str = os.getenv("DISCORD_COMMAND_PREFIX", "!")
+    jeff_discord_id: str = os.getenv("JEFF_DISCORD_ID", "")
 
     deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
     deepseek_base_url: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
@@ -32,6 +33,7 @@ class Settings:
     auto_reply_delay_minutes: int = int(os.getenv("AUTO_REPLY_DELAY_MINUTES", "5"))
     watchdog_poll_seconds: int = int(os.getenv("WATCHDOG_POLL_SECONDS", "30"))
     auto_reply_enabled: bool = os.getenv("AUTO_REPLY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+    inactivity_close_minutes: int = int(os.getenv("INACTIVITY_CLOSE_MINUTES", "30"))
     # Habilita envio de imagens para o LLM (requer modelo com suporte a visão, ex: gpt-4o)
     vision_enabled: bool = os.getenv("VISION_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
     print(f"Settings loaded: app_env={app_env}, sqlite_path={sqlite_path}, "

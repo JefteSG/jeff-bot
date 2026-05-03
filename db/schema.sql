@@ -103,3 +103,18 @@ CREATE INDEX IF NOT EXISTS idx_context_sender_created ON conversation_context (s
 CREATE INDEX IF NOT EXISTS idx_watch_status_incoming ON conversation_watch (status, last_incoming_at);
 CREATE INDEX IF NOT EXISTS idx_watch_channel ON conversation_watch (channel_id);
 CREATE INDEX IF NOT EXISTS idx_summaries_sender_channel ON conversation_summaries (sender_id, channel_id);
+
+-- Rastrea notificações enviadas ao Jeff para que o bot possa repassar a resposta dele ao usuário.
+CREATE TABLE IF NOT EXISTS jeff_relays (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_id INTEGER NOT NULL,
+    user_channel_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'waiting' CHECK (status IN ('waiting', 'replied', 'expired')),
+    trigger TEXT NOT NULL DEFAULT 'unknown',
+    context_msg TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (sender_id) REFERENCES senders (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_jeff_relays_status ON jeff_relays (status, created_at);
