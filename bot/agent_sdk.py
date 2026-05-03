@@ -286,10 +286,9 @@ async def run_agent_reply(
     """
     settings = get_settings()
 
-    # Configura tracing (desabilita envio remoto para OpenAI se solicitado)
-    if settings.agents_tracing_disabled:
-        set_tracing_disabled(True)
-    else:
+    # Configura tracing de forma explícita para evitar estado global residual
+    set_tracing_disabled(settings.agents_tracing_disabled)
+    if not settings.agents_tracing_disabled:
         enable_verbose_stdout_logging()
 
     # Monta o conteúdo de entrada
