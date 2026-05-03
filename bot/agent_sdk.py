@@ -204,7 +204,7 @@ def lookup_knowledge_base(query: str) -> str:
                 (f"%{query}%", f"%{query}%", f"%{query}%"),
             ).fetchall()
     except Exception as exc:
-        print(f"[agent_sdk] lookup_knowledge_base erro ao consultar DB: {exc}")
+        print(f"[agent_sdk] lookup_knowledge_base: erro ao consultar DB: {exc}")
         return "Base de conhecimento indisponível no momento."
 
     if not rows:
@@ -279,7 +279,8 @@ async def run_agent_reply(
     settings = get_settings()
 
     if not settings.deepseek_api_key:
-        return "me manda mais um pouco de contexto"
+        print("[agent_sdk] DEEPSEEK_API_KEY não configurada; resposta desabilitada")
+        return "Serviço temporariamente indisponível"
 
     # Configura tracing de forma simétrica: sempre define o estado globalmente
     # e habilita verbose logging separadamente quando tracing está ativo.
