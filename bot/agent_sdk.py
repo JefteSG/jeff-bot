@@ -72,24 +72,14 @@ def _db_path() -> Path:
 # ---------------------------------------------------------------------------
 # SQLiteSession — implementa o protocolo agents.Session usando SQLite local
 #
-# Cada mensagem trocada com o agente fica em `agent_sessions` como JSON,
-# permitindo retomada de conversa entre processos/reinicializações.
+# A tabela `agent_sessions` e seu índice são definidos em db/schema.sql e
+# criados no startup via api/services/db.py:init_db().  Não há DDL aqui
+# para evitar I/O síncrono dentro do loop de evento.
 #
 # Para migrar para Redis em produção, implemente a mesma interface
 # (session_id, get_items, add_items, pop_item, clear_session) sobre
 # um cliente Redis e passe a nova classe no lugar de SQLiteSession.
 # ---------------------------------------------------------------------------
-
-_CREATE_TABLE = """
-CREATE TABLE IF NOT EXISTS agent_sessions (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT    NOT NULL,
-    item_json  TEXT    NOT NULL,
-    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_agent_sessions_session ON agent_sessions (session_id, id);
-"""
-
 
 class SQLiteSession(SessionABC):
     """Sessão persistida em SQLite.
@@ -97,6 +87,9 @@ class SQLiteSession(SessionABC):
     Implementa o protocolo `agents.Session` armazenando cada item de conversa
     (mensagens, tool calls e resultados) serializado em JSON, em uma tabela
     dedicada do banco local do bot.
+
+    O schema da tabela `agent_sessions` é gerenciado centralmente em
+    `db/schema.sql` e criado no startup por `api/services/db.py:init_db()`.
 
     Args:
         session_id: Identificador único da sessão (ex: discord_id do usuário).
@@ -108,7 +101,6 @@ class SQLiteSession(SessionABC):
     def __init__(self, session_id: str, db_path: str | Path | None = None) -> None:
         self.session_id = session_id
         self._db_path = str(db_path or _db_path())
-        self._ensure_table()
 
     # ------------------------------------------------------------------
     # helpers síncronos (executados via asyncio.to_thread)
@@ -118,10 +110,6 @@ class SQLiteSession(SessionABC):
         conn = sqlite3.connect(self._db_path)
         conn.row_factory = sqlite3.Row
         return conn
-
-    def _ensure_table(self) -> None:
-        with self._conn() as conn:
-            conn.executescript(_CREATE_TABLE)
 
     def _sync_get(self, limit: int | None) -> list[Any]:
         with self._conn() as conn:
@@ -215,7 +203,8 @@ def lookup_knowledge_base(query: str) -> str:
                 """,
                 (f"%{query}%", f"%{query}%", f"%{query}%"),
             ).fetchall()
-    except Exception:
+    except Exception as exc:
+        print(f"[agent_sdk] lookup_knowledge_base erro ao consultar DB: {exc}")
         return "Base de conhecimento indisponível no momento."
 
     if not rows:
@@ -233,7 +222,7 @@ def _build_provider() -> OpenAIProvider:
     """Cria um OpenAIProvider apontando para a API DeepSeek (compatível OpenAI)."""
     settings = get_settings()
     return OpenAIProvider(
-        api_key=settings.deepseek_api_key or "NO_KEY",
+        api_key=settings.deepseek_api_key,
         base_url=settings.deepseek_base_url,
         use_responses=False,  # DeepSeek suporta Chat Completions, não Responses API
     )
@@ -269,6 +258,7 @@ async def run_agent_reply(
     user_message: str,
     session_id: str,
     image_urls: list[str] | None = None,
+    sender_display_name: str | None = None,
 ) -> str:
     """Executa o agente e devolve a resposta final em texto.
 
@@ -276,32 +266,41 @@ async def run_agent_reply(
     cada chamada acumula o contexto sem precisar recuperar e repassar manualmente.
 
     Args:
-        user_message: Mensagem enviada pelo usuário.
+        user_message: Conteúdo bruto da mensagem enviada pelo usuário.
         session_id: Identificador da sessão (ex: discord_id). Mantém o contexto
                     entre chamadas com o mesmo session_id.
         image_urls: URLs de imagens anexadas (usadas se vision_enabled=True).
+        sender_display_name: Nome de exibição do remetente. Quando fornecido,
+                             é acrescentado como prefixo de contexto à mensagem.
 
     Returns:
         Texto da resposta do agente.
     """
     settings = get_settings()
 
-    # Configura tracing (desabilita envio remoto para OpenAI se solicitado)
-    if settings.agents_tracing_disabled:
-        set_tracing_disabled(True)
-    else:
+    if not settings.deepseek_api_key:
+        return "me manda mais um pouco de contexto"
+
+    # Configura tracing de forma simétrica: sempre define o estado globalmente
+    # e habilita verbose logging separadamente quando tracing está ativo.
+    set_tracing_disabled(settings.agents_tracing_disabled)
+    if not settings.agents_tracing_disabled:
         enable_verbose_stdout_logging()
 
-    # Monta o conteúdo de entrada
+    # Monta o conteúdo de entrada com identidade do remetente, se disponível
+    base_text = user_message
+    if sender_display_name:
+        base_text = f"[usuário: {sender_display_name}] {user_message}"
+
     if image_urls and settings.vision_enabled:
-        input_content: Any = [{"type": "text", "text": user_message}]
+        input_content: Any = [{"type": "text", "text": base_text}]
         for url in image_urls:
             input_content.append({"type": "image_url", "image_url": {"url": url}})
     else:
-        input_content = user_message
+        input_content = base_text
         if image_urls:
             input_content = (
-                f"{user_message}\n"
+                f"{base_text}\n"
                 f"[{len(image_urls)} print(s) de erro anexado(s) — visão desabilitada]"
             )
 
@@ -324,3 +323,4 @@ async def run_agent_reply(
         )
 
     return str(result.final_output or "").strip() or "me manda mais um pouco de contexto"
+

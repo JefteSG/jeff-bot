@@ -299,10 +299,14 @@ async def _handle_bot_dm(message: discord.Message) -> None:
     if settings.use_agents_sdk:
         # Usa Agent + Runner + SQLiteSession: o histórico é gerenciado automaticamente.
         # O session_id é o discord_id do remetente para persistir entre reinicializações.
+        # Passa o conteúdo bruto + identidade do remetente; as instruções de comportamento
+        # estão nas `instructions` do Agent e não precisam ser repetidas a cada turno.
+        display_name = sender_global_name or sender_username or None
         reply_text = await run_agent_reply(
-            user_message=prompt,
+            user_message=content,
             session_id=sender_discord_id,
             image_urls=image_urls or None,
+            sender_display_name=display_name,
         )
     else:
         llm_reply = await asyncio.to_thread(generate_reply, prompt, history, image_urls or None)
