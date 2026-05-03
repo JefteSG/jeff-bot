@@ -6,6 +6,7 @@ from typing import Any
 
 import discord
 
+from api.services.discord_outbound import notify_jeff, send_via_userbot
 from api.services.llm import LLMReply, generate_reply
 from config import get_settings
 
@@ -16,10 +17,83 @@ except ModuleNotFoundError:
 
 try:
     from watchdog import SENSITIVE_HINTS
-    from router import _append_context, _connect, _enqueue_pending, _ensure_sender
+    from router import _append_context, _connect, _enqueue_pending, _ensure_sender, _open_jeff_relay, _is_wants_jeff, _is_urgent
 except ModuleNotFoundError:
     from bot.watchdog import SENSITIVE_HINTS
-    from bot.router import _append_context, _connect, _enqueue_pending, _ensure_sender
+    from bot.router import _append_context, _connect, _enqueue_pending, _ensure_sender, _open_jeff_relay, _is_wants_jeff, _is_urgent
+
+
+# Estado para desambiguação multi-turn quando há múltiplos senders com nome similar
+_pending_disambiguation: dict[str, list[dict[str, Any]]] = {}
+
+
+# Keywords para detecção de query de Jeff
+QUERY_KEYWORDS_SUMMARY_DAY = (
+    "resumo do dia",
+    "digest do dia",
+    "o que aconteceu hoje",
+    "o que rolou hoje",
+    "conversas de hoje",
+)
+
+QUERY_KEYWORDS_SUMMARY_USER = (
+    "resumo da conversa com",
+    "conversa com",
+    "me fala do",
+    "me fala da",
+    "como ta o",
+    "como tá o",
+    "como ta a",
+    "como tá a",
+)
+
+QUERY_KEYWORDS_LAST_MESSAGE = (
+    "última mensagem do",
+    "ultima mensagem do",
+    "última mensagem da",
+    "ultima mensagem da",
+    "o que o",
+    "o que a",
+)
+
+
+def _detect_jeff_query(text: str) -> str | None:
+    """Detecta se o texto é uma query de Jeff (summary_user, summary_day, last_message_user) ou None."""
+    lower = text.lower()
+    for keyword in QUERY_KEYWORDS_SUMMARY_DAY:
+        if keyword in lower:
+            return "summary_day"
+    for keyword in QUERY_KEYWORDS_SUMMARY_USER:
+        if keyword in lower:
+            return "summary_user"
+    for keyword in QUERY_KEYWORDS_LAST_MESSAGE:
+        if keyword in lower:
+            return "last_message_user"
+    return None
+
+
+def _extract_name_from_query(text: str, intent: str) -> str:
+    """Extrai fragmento de nome da query após remover a keyword."""
+    lower = text.lower()
+    keywords = []
+    if intent == "summary_day":
+        return ""
+    elif intent == "summary_user":
+        keywords = list(QUERY_KEYWORDS_SUMMARY_USER)
+    elif intent == "last_message_user":
+        keywords = list(QUERY_KEYWORDS_LAST_MESSAGE)
+    for keyword in keywords:
+        if keyword in lower:
+            remainder = lower.split(keyword, 1)[1]
+            cleaned = remainder.strip().rstrip("?!,. ").strip()
+            # Remove artigos no começo (o, a, os, as, um, uma, uns, umas)
+            articles = ("o", "a", "os", "as", "um", "uma", "uns", "umas")
+            for article in articles:
+                if cleaned.startswith(article + " "):
+                    cleaned = cleaned[len(article) + 1:]
+                    break
+            return cleaned
+    return ""
 
 
 def _needs_human_reason(message: str) -> str:
@@ -238,6 +312,221 @@ async def _queue_needs_human(
         await conn.close()
 
 
+
+async def _find_senders_by_name(conn: Any, name_fragment: str) -> list[dict[str, Any]]:
+    """Busca senders no BD pelo nome (LIKE search)."""
+    if len(name_fragment.strip()) < 2:
+        return []
+    cursor = await conn.execute(
+        """
+        SELECT id, discord_id, display_name
+        FROM senders
+        WHERE display_name LIKE ?
+        ORDER BY display_name ASC
+        LIMIT 10
+        """,
+        (f"%{name_fragment}%",),
+    )
+    rows = await cursor.fetchall()
+    return [dict(row) for row in rows] if rows else []
+
+
+async def _get_summary_for_sender(conn: Any, sender_id: int) -> str:
+    """Retorna resumo da conversa para um sender específico."""
+    cursor = await conn.execute(
+        """
+        SELECT summary, last_summarized_at
+        FROM conversation_summaries
+        WHERE sender_id = ?
+        ORDER BY last_summarized_at DESC
+        LIMIT 1
+        """,
+        (sender_id,),
+    )
+    row = await cursor.fetchone()
+    if row and row["summary"]:
+        return str(row["summary"]).strip()
+    return "sem resumo disponível ainda"
+
+
+async def _get_last_user_message(conn: Any, sender_id: int) -> str:
+    """Retorna a última mensagem do usuário."""
+    cursor = await conn.execute(
+        """
+        SELECT message, created_at
+        FROM conversation_context
+        WHERE sender_id = ? AND role = 'user'
+        ORDER BY sequence_no DESC
+        LIMIT 1
+        """,
+        (sender_id,),
+    )
+    row = await cursor.fetchone()
+    if row:
+        created_at = str(row["created_at"] or "")
+        if created_at:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                time_str = dt.strftime("%H:%M")
+            except Exception:
+                time_str = "?"
+        else:
+            time_str = "?"
+        message = str(row["message"] or "")
+        return f"[{time_str}] {message}"
+    return "nenhuma mensagem encontrada"
+
+
+async def _build_day_digest(conn: Any) -> str:
+    """Agregação de atividades do dia de todos os senders."""
+    rows = await conn.execute_fetchall(
+        """
+        SELECT
+            s.display_name,
+            cs.summary,
+            MAX(cc.created_at) AS last_activity
+        FROM conversation_context cc
+        JOIN senders s ON s.id = cc.sender_id
+        LEFT JOIN conversation_summaries cs ON cs.sender_id = cc.sender_id
+        WHERE cc.created_at >= date('now')
+        GROUP BY cc.sender_id
+        ORDER BY last_activity DESC
+        """,
+    )
+    if not rows:
+        return "nenhuma conversa registrada hoje"
+    lines = []
+    for row in rows:
+        name = str(row["display_name"] or "contato")
+        summary = str(row["summary"] or "sem resumo")[:120]
+        last_activity = str(row["last_activity"] or "")
+        if last_activity:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(last_activity.replace("Z", "+00:00"))
+                time_str = dt.strftime("%H:%M")
+            except Exception:
+                time_str = "?"
+        else:
+            time_str = "?"
+        lines.append(f"- {name} ({time_str}): {summary}")
+    return "\n".join(lines)
+
+
+async def _has_recent_notification(conn: Any, sender_id: int) -> bool:
+    """Verifica se já notificamos Jeff sobre este sender nos últimos 2 minutos para evitar duplicação."""
+    cursor = await conn.execute(
+        """
+        SELECT id FROM jeff_relays
+        WHERE sender_id = ? AND status = 'waiting'
+        AND created_at >= datetime('now', '-2 minutes')
+        LIMIT 1
+        """,
+        (sender_id,),
+    )
+    row = await cursor.fetchone()
+    return bool(row)
+
+
+async def _handle_jeff_query(content: str, channel_id: str) -> str | None:
+    """
+    Orquestrador: processa queries de Jeff (resumos, últimas mensagens, digest).
+    Retorna string de resposta ou None se não for uma query reconhecida.
+    """
+    # 1. Verifica se está em fluxo de desambiguação
+    candidates = _pending_disambiguation.get(channel_id)
+    if candidates:
+        stripped = content.strip()
+        if stripped.isdigit():
+            idx = int(stripped) - 1
+            if 0 <= idx < len(candidates):
+                chosen = candidates[idx]
+                _pending_disambiguation.pop(channel_id, None)
+                conn = await _connect()
+                try:
+                    intent = _detect_jeff_query("")  # Dummy para determinar se era summary ou last_message
+                    sender_id = int(chosen["id"])
+                    summary = await _get_summary_for_sender(conn, sender_id)
+                finally:
+                    await conn.close()
+                name = chosen["display_name"] or "contato"
+                return f"{name}: {summary}"
+            else:
+                return f"numero invalido, manda um numero entre 1 e {len(candidates)}"
+        else:
+            # Jeff digitou algo novo — limpa desambiguação e prossegue
+            _pending_disambiguation.pop(channel_id, None)
+
+    # 2. Detecta intenção
+    intent = _detect_jeff_query(content)
+    if intent is None:
+        return None
+
+    # 3. Digest do dia
+    if intent == "summary_day":
+        conn = await _connect()
+        try:
+            digest = await _build_day_digest(conn)
+        finally:
+            await conn.close()
+        return f"resumo do dia:\n{digest}"
+
+    # 4. Busca por contato nomeado
+    name_fragment = _extract_name_from_query(content, intent)
+    if not name_fragment or len(name_fragment.strip()) < 2:
+        return "qual contato voce quer consultar?"
+
+    conn = await _connect()
+    try:
+        matches = await _find_senders_by_name(conn, name_fragment)
+        if not matches:
+            return f"nao encontrei ninguem com '{name_fragment}' no nome"
+        if len(matches) > 1:
+            _pending_disambiguation[channel_id] = matches
+            lines = [f"{i+1}. {m['display_name']}" for i, m in enumerate(matches)]
+            return "encontrei mais de um contato:\n" + "\n".join(lines) + "\nresponde com o numero"
+        # Single match
+        match = matches[0]
+        sender_id = int(match["id"])
+        if intent == "last_message_user":
+            last_msg = await _get_last_user_message(conn, sender_id)
+            name = match["display_name"] or "contato"
+            return f"ultima mensagem de {name}: {last_msg}"
+        else:  # summary_user
+            summary = await _get_summary_for_sender(conn, sender_id)
+            name = match["display_name"] or "contato"
+            return f"{name}: {summary}"
+    finally:
+        await conn.close()
+
+
+async def _pop_jeff_relay() -> dict[str, Any] | None:
+    """Retorna e marca como 'replied' o relay pendente mais antigo de Jeff."""
+    conn = await _connect()
+    try:
+        rows = await conn.execute_fetchall(
+            """
+            SELECT id, sender_id, user_channel_id
+            FROM jeff_relays
+            WHERE status = 'waiting'
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+        )
+        if not rows:
+            return None
+        relay = dict(rows[0])
+        await conn.execute(
+            "UPDATE jeff_relays SET status = 'replied', updated_at = datetime('now') WHERE id = ?",
+            (relay["id"],),
+        )
+        await conn.commit()
+        return relay
+    finally:
+        await conn.close()
+
+
 async def _handle_bot_dm(message: discord.Message) -> None:
     content = str(message.content or "").strip()
     if not content:
@@ -250,6 +539,21 @@ async def _handle_bot_dm(message: discord.Message) -> None:
     sender_name = sender_global_name or sender_username
     channel_id = str(message.channel.id)
     message_id = str(message.id)
+    settings = get_settings()
+
+    # Jeff está respondendo no DM do bot → repassa ao usuário que estava esperando.
+    if settings.jeff_discord_id and sender_discord_id == settings.jeff_discord_id:
+        relay = await _pop_jeff_relay()
+        if relay:
+            sent = await asyncio.to_thread(send_via_userbot, relay["user_channel_id"], content)
+            ack = "Enviado!" if sent.success else f"Falha ao enviar: {sent.error}"
+            await message.channel.send(ack)
+            return
+        # Sem relay pendente: Jeff pode estar fazendo queries sobre conversas ou testando.
+        reply = await _handle_jeff_query(content, channel_id)
+        if reply is not None:
+            await message.channel.send(reply)
+            return
 
     conn = await _connect()
     try:
@@ -274,6 +578,45 @@ async def _handle_bot_dm(message: discord.Message) -> None:
         if str(getattr(att, "content_type", "") or "").lower().startswith("image/")
     ]
 
+    # Pessoa pediu explicitamente para chamar o Jeff OU enviou mensagem urgente.
+    wants_jeff = _is_wants_jeff(content)
+    urgent = _is_urgent(content)
+
+    if wants_jeff or urgent:
+        conn = await _connect()
+        try:
+            summary = await _update_summary_if_needed(conn, sender_id, channel_id)
+            trigger = "user_request" if wants_jeff else "urgency"
+
+            # Verifica deduplicação: router.py pode já ter notificado Jeff
+            already_notified = await _has_recent_notification(conn, sender_id)
+            if already_notified:
+                print(f"[official_bot] notificação recente já existe para sender_id={sender_id}, ignorando duplicata")
+                reply = "Vou chamar o Jeff agora!" if wants_jeff else "Entendido, vou avisar o Jeff que é urgente!"
+                await _append_context(conn, sender_id, role="assistant", intent="unknown", message=reply)
+                await message.channel.send(reply)
+                await conn.close()
+                return
+
+            await _open_jeff_relay(conn, sender_id, channel_id, content, trigger)
+        finally:
+            await conn.close()
+
+        trigger_label = "user_request" if wants_jeff else "urgency"
+        notified = await asyncio.to_thread(notify_jeff, sender_name, content, trigger_label, summary)
+        reply = "Vou chamar o Jeff agora!" if wants_jeff else "Entendido, vou avisar o Jeff que é urgente!"
+        if not notified.success:
+            reply = "Tentei chamar o Jeff mas deu um problema, ele vai ver em breve."
+        await message.channel.send(reply)
+
+        conn = await _connect()
+        try:
+            await _append_context(conn, sender_id, role="assistant", intent="unknown", message=reply)
+        finally:
+            await conn.close()
+        return
+
+    # Mensagem sensível → fila para Jeff.
     reason = _needs_human_reason(content)
     if reason:
         await _queue_needs_human(
@@ -294,6 +637,7 @@ async def _handle_bot_dm(message: discord.Message) -> None:
             await conn.close()
         return
 
+    # Resposta normal via LLM.
     prompt = _bot_dm_prompt(content, sender_global_name, sender_username)
     settings = get_settings()
     if settings.use_agents_sdk:
@@ -317,6 +661,12 @@ async def _handle_bot_dm(message: discord.Message) -> None:
     conn = await _connect()
     try:
         await _append_context(conn, sender_id, role="assistant", intent="unknown", message=reply_text)
+
+        # Confiança baixa → notifica Jeff e abre relay para ele poder complementar.
+        if llm_reply.confidence_score < 0.5:
+            summary = await _update_summary_if_needed(conn, sender_id, channel_id)
+            await _open_jeff_relay(conn, sender_id, channel_id, content, "low_confidence")
+            await asyncio.to_thread(notify_jeff, sender_name, content, "low_confidence", summary)
     finally:
         await conn.close()
 
