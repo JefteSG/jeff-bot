@@ -9,6 +9,7 @@ import discord
 from api.services.discord_outbound import notify_jeff, send_via_userbot
 from api.services.llm import LLMReply, generate_reply
 from config import get_settings
+from bot.agent_sdk import run_agent_reply
 
 try:
     from watchdog import SENSITIVE_HINTS
@@ -633,9 +634,22 @@ async def _handle_bot_dm(message: discord.Message) -> None:
         return
 
     # Resposta normal via LLM.
-    prompt = _bot_dm_prompt(content, sender_global_name, sender_username)
-    llm_reply = await asyncio.to_thread(generate_reply, prompt, history, image_urls or None)
-    reply_text = llm_reply.text.strip() or "me manda mais um pouco de contexto"
+    if settings.use_agents_sdk:
+        # Usa Agent + Runner + SQLiteSession: o histórico é gerenciado automaticamente.
+        # O session_id é o discord_id do remetente para persistir entre reinicializações.
+        # Passa o conteúdo bruto + identidade do remetente; as instruções de comportamento
+        # estão nas `instructions` do Agent e não precisam ser repetidas a cada turno.
+        display_name = sender_global_name or sender_username or None
+        reply_text = await run_agent_reply(
+            user_message=content,
+            session_id=sender_discord_id,
+            image_urls=image_urls or None,
+            sender_display_name=display_name,
+        )
+    else:
+        prompt = _bot_dm_prompt(content, sender_global_name, sender_username)
+        llm_reply = await asyncio.to_thread(generate_reply, prompt, history, image_urls or None)
+        reply_text = llm_reply.text.strip() or "me manda mais um pouco de contexto"
 
     await message.channel.send(reply_text)
 
@@ -644,7 +658,8 @@ async def _handle_bot_dm(message: discord.Message) -> None:
         await _append_context(conn, sender_id, role="assistant", intent="unknown", message=reply_text)
 
         # Confiança baixa → notifica Jeff e abre relay para ele poder complementar.
-        if llm_reply.confidence_score < 0.5:
+        # Só aplicável no fluxo generate_reply; o agents SDK não expõe confidence_score.
+        if not settings.use_agents_sdk and llm_reply.confidence_score < 0.5:
             summary = await _update_summary_if_needed(conn, sender_id, channel_id)
             await _open_jeff_relay(conn, sender_id, channel_id, content, "low_confidence")
             await asyncio.to_thread(notify_jeff, sender_name, content, "low_confidence", summary)

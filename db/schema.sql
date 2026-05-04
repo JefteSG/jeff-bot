@@ -104,6 +104,13 @@ CREATE INDEX IF NOT EXISTS idx_watch_status_incoming ON conversation_watch (stat
 CREATE INDEX IF NOT EXISTS idx_watch_channel ON conversation_watch (channel_id);
 CREATE INDEX IF NOT EXISTS idx_summaries_sender_channel ON conversation_summaries (sender_id, channel_id);
 
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT    NOT NULL,
+    item_json  TEXT    NOT NULL,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_session ON agent_sessions (session_id, id);
 -- Rastrea notificações enviadas ao Jeff para que o bot possa repassar a resposta dele ao usuário.
 CREATE TABLE IF NOT EXISTS jeff_relays (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
