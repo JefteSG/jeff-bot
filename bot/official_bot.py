@@ -634,8 +634,6 @@ async def _handle_bot_dm(message: discord.Message) -> None:
         return
 
     # Resposta normal via LLM.
-    prompt = _bot_dm_prompt(content, sender_global_name, sender_username)
-    settings = get_settings()
     if settings.use_agents_sdk:
         # Usa Agent + Runner + SQLiteSession: o histórico é gerenciado automaticamente.
         # O session_id é o discord_id do remetente para persistir entre reinicializações.
@@ -649,6 +647,7 @@ async def _handle_bot_dm(message: discord.Message) -> None:
             sender_display_name=display_name,
         )
     else:
+        prompt = _bot_dm_prompt(content, sender_global_name, sender_username)
         llm_reply = await asyncio.to_thread(generate_reply, prompt, history, image_urls or None)
         reply_text = llm_reply.text.strip() or "me manda mais um pouco de contexto"
 
