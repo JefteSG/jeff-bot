@@ -94,13 +94,24 @@ class SQLiteSession(SessionABC):
     Args:
         session_id: Identificador único da sessão (ex: discord_id do usuário).
         db_path: Caminho para o arquivo SQLite. Se omitido, usa o padrão do bot.
+        max_items: Número máximo de itens retidos por sessão. Itens mais antigos
+            são removidos automaticamente após cada ``add_items``. Padrão: 200
+            (≈ 100 turnos de conversa).
     """
 
     session_settings: SessionSettings | None = None
 
-    def __init__(self, session_id: str, db_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        db_path: str | Path | None = None,
+        max_items: int = 200,
+    ) -> None:
+        if max_items < 1:
+            raise ValueError(f"max_items must be >= 1, got {max_items}")
         self.session_id = session_id
         self._db_path = str(db_path or _db_path())
+        self._max_items = max_items
 
     # ------------------------------------------------------------------
     # helpers síncronos (executados via asyncio.to_thread)
@@ -133,6 +144,16 @@ class SQLiteSession(SessionABC):
             conn.executemany(
                 "INSERT INTO agent_sessions (session_id, item_json) VALUES (?, ?)",
                 [(self.session_id, json.dumps(item)) for item in items],
+            )
+            # Prune: keep only the most recent max_items rows for this session.
+            conn.execute(
+                "DELETE FROM agent_sessions WHERE session_id = ? AND id < ("
+                "  SELECT MIN(id) FROM ("
+                "    SELECT id FROM agent_sessions WHERE session_id = ?"
+                "    ORDER BY id DESC LIMIT ?"
+                "  )"
+                ")",
+                (self.session_id, self.session_id, self._max_items),
             )
 
     def _sync_pop(self) -> Any | None:
