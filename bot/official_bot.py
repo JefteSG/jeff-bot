@@ -659,7 +659,8 @@ async def _handle_bot_dm(message: discord.Message) -> None:
         await _append_context(conn, sender_id, role="assistant", intent="unknown", message=reply_text)
 
         # Confiança baixa → notifica Jeff e abre relay para ele poder complementar.
-        if llm_reply.confidence_score < 0.5:
+        # Só aplicável no fluxo generate_reply; o agents SDK não expõe confidence_score.
+        if not settings.use_agents_sdk and llm_reply.confidence_score < 0.5:
             summary = await _update_summary_if_needed(conn, sender_id, channel_id)
             await _open_jeff_relay(conn, sender_id, channel_id, content, "low_confidence")
             await asyncio.to_thread(notify_jeff, sender_name, content, "low_confidence", summary)
