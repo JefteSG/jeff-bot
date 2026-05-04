@@ -56,17 +56,23 @@ from config import get_settings
 
 
 # ---------------------------------------------------------------------------
-# Utilitário de path (replicado do router para evitar import circular)
+# Utilitário de path/conexão SQLite
 # ---------------------------------------------------------------------------
 
 def _db_path() -> Path:
-    settings = get_settings()
-    root = Path(__file__).resolve().parents[1]
-    db_path = Path(settings.sqlite_path)
-    if not db_path.is_absolute():
-        db_path = root / db_path
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    return db_path
+    # Import local para reaproveitar a lógica centralizada sem introduzir
+    # dependência em nível de módulo.
+    from api.services.db import _sqlite_path
+
+    return _sqlite_path()
+
+
+def _db_connection() -> sqlite3.Connection:
+    # Reutiliza a factory compartilhada para manter a conexão configurada
+    # de forma consistente com o restante da aplicação (incluindo PRAGMAs).
+    from api.services.db import get_connection
+
+    return get_connection()
 
 
 # ---------------------------------------------------------------------------
