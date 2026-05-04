@@ -8,8 +8,19 @@ from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 import aiosqlite
 
-from api.services.discord_outbound import notify_jeff, send_via_userbot
-from api.services.llm import ask_error_triage_question, generate_error_diagnosis, generate_reply
+from api.services.discord_outbound import notify_jeff, resolve_dm_channel_id, send_discord_message, send_via_userbot
+from api.services.llm import (
+    ask_error_triage_question,
+    generate_error_diagnosis,
+    generate_reply,
+    get_active_personality_name,
+)
+from api.services.memory import (
+    find_error_solution,
+    get_short_term_context,
+    increment_solution_score,
+    save_message_with_intent,
+)
 from api.services.notion import create_task_card
 from config import get_settings
 
@@ -19,6 +30,30 @@ if TYPE_CHECKING:
 
 INTENTS = {"routine_question", "error_report", "task_request", "greeting", "unknown"}
 CONTEXT_WINDOW_MINUTES = 3
+LEARNED_SOLUTION_MARKER = "learned_solution_followup:"
+
+POSITIVE_RESOLUTION_HINTS = (
+    "sim",
+    "resolveu",
+    "resolvido",
+    "funcionou",
+    "deu certo",
+    "era isso",
+    "perfeito",
+    "boa",
+)
+
+NEGATIVE_RESOLUTION_HINTS = (
+    "nao",
+    "não",
+    "continua",
+    "nao resolveu",
+    "não resolveu",
+    "ainda nao",
+    "ainda não",
+    "mesmo erro",
+    "persistiu",
+)
 
 WANTS_JEFF_HINTS = (
     "avisa o jeff",
@@ -113,6 +148,22 @@ async def _connect() -> aiosqlite.Connection:
     conn = await aiosqlite.connect(_sqlite_path())
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys = ON;")
+
+    # Compatibilidade com versões antigas do aiosqlite sem helpers fetchone/fetchall.
+    if not hasattr(conn, "execute_fetchone"):
+        async def _execute_fetchone(query: str, params: tuple[Any, ...] = ()) -> aiosqlite.Row | None:
+            cursor = await conn.execute(query, params)
+            return await cursor.fetchone()
+
+        setattr(conn, "execute_fetchone", _execute_fetchone)
+
+    if not hasattr(conn, "execute_fetchall"):
+        async def _execute_fetchall(query: str, params: tuple[Any, ...] = ()) -> list[aiosqlite.Row]:
+            cursor = await conn.execute(query, params)
+            return await cursor.fetchall()
+
+        setattr(conn, "execute_fetchall", _execute_fetchall)
+
     return conn
 
 
@@ -163,32 +214,93 @@ async def _append_context(
     intent: str,
     message: str,
 ) -> None:
-    # Salva contexto incremental para triagem e histórico de conversa.
-    sequence_no = await _next_sequence(conn, sender_id)
-    await conn.execute(
-        """
-        INSERT INTO conversation_context (sender_id, role, intent, message, sequence_no)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (sender_id, role, intent if intent in INTENTS else "unknown", message, sequence_no),
-    )
-    await conn.commit()
+    # Centraliza a política de contexto diário no serviço de memória.
+    await save_message_with_intent(sender_id, role, message, conn, intent=intent)
 
 
 async def _sender_history(conn: aiosqlite.Connection, sender_id: int, limit: int = 8) -> list[dict[str, str]]:
-    rows = await conn.execute_fetchall(
-        """
-        SELECT role, message
-        FROM conversation_context
-        WHERE sender_id = ?
-          AND created_at >= datetime('now', ?)
-        ORDER BY sequence_no ASC
-        LIMIT ?
-        """,
-        (sender_id, f"-{CONTEXT_WINDOW_MINUTES} minutes", limit),
+    history = await get_short_term_context(sender_id, conn)
+    if limit <= 0:
+        return history
+    return history[-limit:]
+
+
+def _message_has_hint(text: str, hints: tuple[str, ...]) -> bool:
+    normalized = " " + text.lower().replace("\n", " ").strip() + " "
+    return any(hint in normalized for hint in hints)
+
+
+def _message_indicates_success(text: str) -> bool:
+    return _message_has_hint(text, POSITIVE_RESOLUTION_HINTS)
+
+
+def _message_indicates_failure(text: str) -> bool:
+    return _message_has_hint(text, NEGATIVE_RESOLUTION_HINTS)
+
+
+def _parse_keywords(raw_text: str) -> list[str]:
+    tokens = [token.strip().lower() for token in raw_text.replace("\n", ",").split(",")]
+    keywords: list[str] = []
+    for token in tokens:
+        cleaned = " ".join(token.split())
+        if len(cleaned) < 2 or cleaned in keywords:
+            continue
+        keywords.append(cleaned)
+    return keywords[:6]
+
+
+async def _extract_error_keywords(content: str, history: list[dict[str, str]]) -> list[str]:
+    prompt = (
+        "Extraia até 6 keywords técnicas do erro abaixo. "
+        "Responda apenas com termos separados por vírgula, sem explicar.\n\n"
+        f"Mensagem: {content}"
     )
-    history = [{"role": str(row["role"]), "content": str(row["message"])} for row in rows]
-    return history
+    try:
+        llm_reply = await asyncio.to_thread(generate_reply, prompt, history, None, 50)
+        keywords = _parse_keywords(llm_reply.text)
+        if keywords:
+            return keywords
+    except Exception as exc:
+        print(f"[router] erro ao extrair keywords do erro: {exc}")
+
+    return _parse_keywords(content)
+
+
+async def _pending_solution_id(conn: aiosqlite.Connection, sender_id: int) -> int | None:
+    try:
+        row = await _fetchone(
+            conn,
+            """
+            SELECT message
+            FROM conversation_context
+            WHERE sender_id = ?
+              AND role = 'system'
+              AND date(created_at) = date('now')
+              AND message LIKE ?
+            ORDER BY sequence_no DESC
+            LIMIT 1
+            """,
+            (sender_id, f"{LEARNED_SOLUTION_MARKER}%"),
+        )
+        if not row:
+            return None
+        raw_message = str(row["message"] or "")
+        _, _, raw_id = raw_message.partition(":")
+        return int(raw_id) if raw_id.isdigit() else None
+    except Exception as exc:
+        print(f"[router] erro ao buscar solução pendente: {exc}")
+        return None
+
+
+async def _clear_pending_solution_marker(conn: aiosqlite.Connection, sender_id: int) -> None:
+    try:
+        await conn.execute(
+            "DELETE FROM conversation_context WHERE sender_id = ? AND role = 'system' AND message LIKE ?",
+            (sender_id, f"{LEARNED_SOLUTION_MARKER}%"),
+        )
+        await conn.commit()
+    except Exception as exc:
+        print(f"[router] erro ao limpar marcador de solução pendente: {exc}")
 
 
 async def _find_recent_pre_ai_queue(
@@ -295,14 +407,16 @@ async def _enqueue_pending(
     confidence_score: float,
     meta: dict[str, Any] | None = None,
 ) -> int:
-    print(f"[enqueue_pending] sender_id={sender_id}, intent={intent}, original_msg={original_msg}, suggested_reply={suggested_reply}, confidence_score={confidence_score}, meta={meta}")
+    meta_payload = dict(meta or {})
+    meta_payload.setdefault("personality", get_active_personality_name())
+    print(f"[enqueue_pending] sender_id={sender_id}, intent={intent}, original_msg={original_msg}, suggested_reply={suggested_reply}, confidence_score={confidence_score}, meta={meta_payload}")
     try:
         cursor = await conn.execute(
             """
             INSERT INTO message_queue (sender_id, status, intent, original_msg, suggested_reply, confidence_score, meta_json)
             VALUES (?, 'pending', ?, ?, ?, ?, ?)
             """,
-            (sender_id, intent, original_msg, suggested_reply, confidence_score, json.dumps(meta or {})),
+            (sender_id, intent, original_msg, suggested_reply, confidence_score, json.dumps(meta_payload)),
         )
         await conn.commit()
         print(f"[enqueue_pending] Inserido com sucesso, queue_id={cursor.lastrowid}")
@@ -320,6 +434,8 @@ async def _upsert_conversation_watch(
     message_id: str,
     meta: dict[str, Any] | None = None,
 ) -> None:
+    meta_payload = dict(meta or {})
+    meta_payload.setdefault("personality", get_active_personality_name())
     await conn.execute(
         """
         INSERT INTO conversation_watch (
@@ -342,7 +458,7 @@ async def _upsert_conversation_watch(
             meta_json = excluded.meta_json,
             updated_at = datetime('now')
         """,
-        (sender_id, channel_id, content, message_id, json.dumps(meta or {})),
+        (sender_id, channel_id, content, message_id, json.dumps(meta_payload)),
     )
     await conn.commit()
 
@@ -492,9 +608,32 @@ async def _route_core(
             return {"action": "queued", "intent": "unknown"}
 
         history = await _sender_history(conn, sender_id)
-        intent, intent_confidence = await _classify_intent_via_llm(content, history)
+        pending_solution_id = await _pending_solution_id(conn, sender_id)
 
-        await _append_context(conn, sender_id, role="user", intent=intent, message=content)
+        if pending_solution_id:
+            await _append_context(conn, sender_id, role="user", intent="error_report", message=content)
+            if _message_indicates_success(content):
+                await increment_solution_score(pending_solution_id, True, conn)
+                await _clear_pending_solution_marker(conn, sender_id)
+                confirmation = "boa, vou guardar essa solução como válida."
+                await _safe_reply(send_reply, confirmation)
+                await _append_context(conn, sender_id, role="assistant", intent="unknown", message=confirmation)
+                return {"action": "replied", "intent": "error_report", "phase": "learned_solution_feedback"}
+
+            if _message_indicates_failure(content):
+                await increment_solution_score(pending_solution_id, False, conn)
+                await _clear_pending_solution_marker(conn, sender_id)
+                history = await _sender_history(conn, sender_id)
+                intent = "error_report"
+                intent_confidence = 1.0
+            else:
+                reminder = "me responde só sim ou não se resolveu."
+                await _safe_reply(send_reply, reminder)
+                await _append_context(conn, sender_id, role="assistant", intent="unknown", message=reminder)
+                return {"action": "replied", "intent": "error_report", "phase": "awaiting_feedback"}
+        else:
+            intent, intent_confidence = await _classify_intent_via_llm(content, history)
+            await _append_context(conn, sender_id, role="user", intent=intent, message=content)
 
         if intent == "greeting":
             greeting = "fala! manda o contexto que eu te ajudo rapidinho."
@@ -541,12 +680,34 @@ async def _route_core(
 
         if intent == "error_report":
             try:
+                keywords = await _extract_error_keywords(content, history)
+                learned_solution = await find_error_solution(keywords, conn)
+                if learned_solution:
+                    learned_reply = f"{str(learned_solution['solution'])}\n\nResolveu com isso? Responde sim ou não."
+                    await _safe_reply(send_reply, learned_reply)
+                    await _append_context(conn, sender_id, role="assistant", intent="unknown", message=learned_reply)
+                    await _append_context(
+                        conn,
+                        sender_id,
+                        role="system",
+                        intent="unknown",
+                        message=f"{LEARNED_SOLUTION_MARKER}{int(learned_solution['id'])}",
+                    )
+                    return {
+                        "action": "replied",
+                        "intent": intent,
+                        "phase": "learned_solution",
+                        "solution_id": int(learned_solution["id"]),
+                    }
+
                 asked_row = await _fetchone(
                     conn,
                     """
                     SELECT COUNT(*) AS asked_count
                     FROM conversation_context
                     WHERE sender_id = ? AND intent = 'error_report' AND role = 'assistant'
+                      AND date(created_at) = date('now')
+                      AND message NOT LIKE '%Resolveu com isso?%'
                     """,
                     (sender_id,),
                 )
@@ -557,6 +718,7 @@ async def _route_core(
                     SELECT message
                     FROM conversation_context
                     WHERE sender_id = ? AND intent = 'error_report'
+                      AND date(created_at) = date('now')
                     ORDER BY sequence_no ASC
                     LIMIT 20
                     """,
@@ -564,7 +726,7 @@ async def _route_core(
                 )
                 error_history = [str(row["message"]) for row in error_rows]
 
-                if asked_count < 2:
+                if asked_count < 3:
                     question = await _llm_triage_question(content, history, asked_count)
                     await _safe_reply(send_reply, question)
                     await _append_context(conn, sender_id, role="assistant", intent=intent, message=question)
@@ -819,6 +981,37 @@ async def route_payload(payload: dict[str, str]) -> dict[str, Any]:
     return await _route_core(payload, send_reply=None)
 
 
+async def route_payload_with_bot_reply(payload: dict[str, str]) -> dict[str, Any]:
+    """Roteia payload e envia respostas no próprio canal via bot oficial."""
+    channel_id = str(payload.get("channel_id") or "")
+    reply_to_message_id = str(payload.get("message_id") or "")
+    print(f"[router] route_payload_with_bot_reply channel_id={channel_id!r}")
+
+    async def _send_reply(text: str) -> None:
+        if not channel_id:
+            print("[router] _send_reply: channel_id vazio, resposta descartada")
+            return
+        result = await asyncio.to_thread(
+            send_discord_message,
+            channel_id,
+            text,
+            reply_to_message_id or None,
+        )
+        if result.success:
+            return
+        # Bot oficial sem acesso ao canal (403/50001) → fallback para userbot
+        err = result.error or ""
+        if "403" in err or "50001" in err:
+            print(f"[router] bot sem acesso ao canal {channel_id}, usando userbot como fallback")
+            fallback = await asyncio.to_thread(send_via_userbot, channel_id, text, "server_reply")
+            if not fallback.success:
+                print(f"[router] fallback userbot também falhou: {fallback.error}")
+        else:
+            print(f"[router] falha ao responder no canal {channel_id}: {err}")
+
+    return await _route_core(payload, send_reply=_send_reply)
+
+
 async def _open_jeff_relay(conn: aiosqlite.Connection, sender_id: int, user_channel_id: str, context_msg: str, trigger: str) -> None:
     """Registra relay pendente Jeff → usuário, ignorando se já existe um aberto."""
     existing = await conn.execute_fetchall(
@@ -836,7 +1029,8 @@ async def _open_jeff_relay(conn: aiosqlite.Connection, sender_id: int, user_chan
 
 async def _has_recent_notification(conn: aiosqlite.Connection, sender_id: int) -> bool:
     """Verifica se já notificamos Jeff sobre este sender nos últimos 2 minutos para evitar duplicação."""
-    row = await conn.execute_fetchone(
+    row = await _fetchone(
+        conn,
         """
         SELECT id FROM jeff_relays
         WHERE sender_id = ? AND status = 'waiting'
@@ -903,6 +1097,7 @@ async def record_incoming_message(payload: dict[str, str]) -> dict[str, Any]:
             print(f"[router] notificando Jeff — trigger={trigger}, sender={sender_discord_id}")
             asyncio.create_task(_notify_jeff_background(
                 sender_name=sender_name,
+                sender_discord_id=sender_discord_id,
                 content=content,
                 channel_id=effective_channel,
                 reply_text=reply_text,
@@ -917,6 +1112,7 @@ async def record_incoming_message(payload: dict[str, str]) -> dict[str, Any]:
 
 async def _notify_jeff_background(
     sender_name: str,
+    sender_discord_id: str,
     content: str,
     channel_id: str,
     reply_text: str,
@@ -924,11 +1120,15 @@ async def _notify_jeff_background(
 ) -> None:
     """Envia resposta ao usuário e notifica Jeff em background."""
     try:
-        result = await asyncio.to_thread(send_via_userbot, channel_id, reply_text)
-        if not result.success:
-            print(f"[router] falha ao responder usuario (jeff_call): {result.error}")
+        resolved = await asyncio.to_thread(resolve_dm_channel_id, sender_discord_id)
+        if not resolved.success or not resolved.channel_id:
+            print(f"[router] falha ao abrir DM do bot para usuario (jeff_call): {resolved.error}")
+        else:
+            result = await asyncio.to_thread(send_discord_message, resolved.channel_id, reply_text)
+            if not result.success:
+                print(f"[router] falha ao responder usuario via bot (jeff_call): {result.error}")
     except Exception as exc:
-        print(f"[router] erro ao responder usuario (jeff_call): {exc}")
+        print(f"[router] erro ao responder usuario via bot (jeff_call): {exc}")
 
     try:
         result = await asyncio.to_thread(notify_jeff, sender_name, content, trigger, "")

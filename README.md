@@ -60,6 +60,15 @@ python -m pip install --no-deps selfcord.py==1.0.3
 cp .env.example .env
 ```
 
+Personalidade do bot via `.env`:
+
+- `BOT_PERSONALITY=jeff_direct` (padrão)
+- `BOT_PERSONALITY=friendly_mentor`
+- `BOT_PERSONALITY=strict_sre`
+- `BOT_PERSONALITY_CUSTOM=` (opcional, para instruções extras)
+
+A personalidade ativa é registrada nos logs de inicialização e também em `meta_json` das filas.
+
 4. Inicie API:
 
 ```bash

@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from api.services import db
 from api.services.discord_outbound import resolve_dm_channel_id, send_discord_message
-from api.services.llm import generate_reply
+from api.services.llm import generate_reply, get_active_personality_name, get_system_prompt
 
 
 router = APIRouter(prefix="/messages", tags=["messages"])
@@ -112,12 +112,13 @@ async def approve_message(queue_id: int, payload: ApprovalActionPayload) -> dict
         sender_id = int(row["sender_id"])
         image_urls = [str(u) for u in (meta.get("image_urls") or []) if u]
         history = _recent_sender_history(sender_id)
-        # Adiciona system prompt ao início do contexto
+        # Adiciona prompt de personalidade selecionada no .env.
         system_prompt = {
             "role": "system",
             "content": (
+                f"{get_system_prompt()}\n\n"
                 "Você responde no lugar de Jefte no Discord. "
-                "Siga os exemplos abaixo à risca — esse é o único estilo aceito.\n\n"
+                "Siga os exemplos abaixo à risca para manter o estilo de resposta.\n\n"
 
                 "EXEMPLOS:\n"
                 "Pergunta: oi tudo bom?\n"
@@ -129,20 +130,20 @@ async def approve_message(queue_id: int, payload: ApprovalActionPayload) -> dict
                 "Pergunta: como vejo o log do serviço x?\n"
                 "Resposta: journalctl -u x -f\n\n"
 
-                "Pergunta: tá dando erro 502 no site\n"
+                "Pergunta: ta dando erro 502 no site\n"
                 "Resposta: qual site?\n\n"
 
                 "Pergunta: o site taltal\n"
-                "Resposta: reinicia o nginx lá e me fala\n\n"
+                "Resposta: reinicia o nginx la e me fala\n\n"
 
                 "REGRAS:\n"
-                "- máximo 10 palavras por resposta\n"
+                "- maximo 10 palavras por resposta\n"
                 "- se precisar de mais info, faz UMA pergunta curta\n"
-                "- só manda o comando, sem explicar\n"
-                "- nunca cumprimente de volta se já cumprimentou antes na conversa\n"
+                "- so manda o comando, sem explicar\n"
+                "- nunca cumprimente de volta se ja cumprimentou antes na conversa\n"
                 "- zero formalidade, zero emojis, zero 'claro!', zero 'com certeza!'\n"
-                "- se não souber, responde: deixa eu verificar\n"
-            )
+                "- se nao souber, responde: deixa eu verificar\n"
+            ),
         }
         history.insert(0, system_prompt)
         llm_reply = await asyncio.to_thread(generate_reply, str(row["original_msg"]), history, image_urls or None)
@@ -150,6 +151,7 @@ async def approve_message(queue_id: int, payload: ApprovalActionPayload) -> dict
         meta["pre_ai"] = False
         meta["approved_for_ai"] = True
         meta["response_approval"] = True
+        meta["personality"] = get_active_personality_name()
 
         db.execute(
             """

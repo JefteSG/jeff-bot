@@ -92,6 +92,28 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
     UNIQUE (sender_id, channel_id)
 );
 
+CREATE TABLE IF NOT EXISTS error_solutions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    keywords TEXT NOT NULL,
+    error_pattern TEXT NOT NULL,
+    solution TEXT NOT NULL,
+    source TEXT DEFAULT 'ia' CHECK (source IN ('manual', 'ia', 'usuario')),
+    success_count INTEGER DEFAULT 0,
+    fail_count INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS conversation_closures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_id INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    useful INTEGER DEFAULT 0 CHECK (useful IN (0, 1)),
+    resolved INTEGER DEFAULT 0 CHECK (resolved IN (0, 1)),
+    turns INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (sender_id) REFERENCES senders(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_senders_discord_id ON senders (discord_id);
 CREATE INDEX IF NOT EXISTS idx_senders_mode ON senders (mode);
 CREATE INDEX IF NOT EXISTS idx_kb_category ON knowledge_base (category);
@@ -103,6 +125,18 @@ CREATE INDEX IF NOT EXISTS idx_context_sender_created ON conversation_context (s
 CREATE INDEX IF NOT EXISTS idx_watch_status_incoming ON conversation_watch (status, last_incoming_at);
 CREATE INDEX IF NOT EXISTS idx_watch_channel ON conversation_watch (channel_id);
 CREATE INDEX IF NOT EXISTS idx_summaries_sender_channel ON conversation_summaries (sender_id, channel_id);
+CREATE INDEX IF NOT EXISTS idx_error_solutions_created ON error_solutions (created_at);
+CREATE INDEX IF NOT EXISTS idx_error_solutions_score ON error_solutions (success_count DESC, fail_count ASC);
+CREATE INDEX IF NOT EXISTS idx_closures_sender_created ON conversation_closures (sender_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS discussion_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT NOT NULL UNIQUE,
+    guild_id TEXT NOT NULL,
+    channel_name TEXT,
+    added_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_discussion_channels_channel ON discussion_channels (channel_id);
 
 CREATE TABLE IF NOT EXISTS agent_sessions (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,

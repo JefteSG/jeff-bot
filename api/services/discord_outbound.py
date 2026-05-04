@@ -231,13 +231,21 @@ def notify_jeff(user_name: str, user_message: str, trigger: str = "", summary: s
     return DiscordSendResult(success=False, message_id=None, error="Erro desconhecido")
 
 
-def send_via_userbot(channel_id: str, content: str) -> DiscordSendResult:
-    """Envia mensagem em um canal usando o token do userbot (conta pessoal).
+def send_via_userbot(channel_id: str, content: str, purpose: str = "message") -> DiscordSendResult:
+    """Envia mensagem via userbot.
 
-    Usado como fallback quando o bot oficial não tem servidor em comum com o
-    usuário (erro 50278) — o canal original da DM pertence ao userbot, então
-    ele sempre tem acesso para enviar lá.
+    Usos permitidos:
+    - 'config': link OAuth de autorização
+    - 'server_reply': fallback quando o bot oficial não tem acesso ao canal de servidor
+    Outros usos são bloqueados por política.
     """
+    if purpose not in ("config", "server_reply"):
+        return DiscordSendResult(
+            success=False,
+            message_id=None,
+            error="Envio via userbot bloqueado por politica (somente config/server_reply)",
+        )
+
     settings = get_settings()
     if not settings.discord_user_token:
         return DiscordSendResult(success=False, message_id=None, error="DISCORD_USER_TOKEN ausente")

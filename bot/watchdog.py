@@ -299,7 +299,27 @@ async def _try_auto_reply(watch: dict[str, Any]) -> bool:
         watch["auto_reply_blocked_reason"] = "LLM sem resposta"
         return False
 
-    # Tenta primeiro pelo bot oficial (DM dedicada do bot com o usuário).
+    # Se channel_id é um canal real (servidor ou DM já aberta pelo bot), tenta enviar direto.
+    # channel_id sintético ("sender:...") significa que o canal original não foi capturado,
+    # então precisamos resolver a DM.
+    is_synthetic_channel = channel_id.startswith("sender:")
+    if not is_synthetic_channel:
+        sent = await asyncio.to_thread(send_discord_message, channel_id, reply_text, None)
+        if sent.success:
+            await _mark_auto_replied(watch, reply_text, sent.message_id)
+            return True
+        # Canal de servidor com acesso negado (403) → não tenta DM nem OAuth, apenas loga.
+        send_error = sent.error or ""
+        if "403" in send_error or "50001" in send_error:
+            print(f"[watchdog] sem acesso ao canal {channel_id} (403/50001), pulando — {send_error}")
+            watch["auto_reply_blocked_reason"] = f"sem acesso ao canal: {send_error}"
+            return False
+        # Outros erros em canal de servidor → loga e desiste também (não manda DM spam).
+        print(f"[watchdog] falha ao responder no canal {channel_id}: {send_error}")
+        watch["auto_reply_blocked_reason"] = f"falha no canal de servidor: {send_error}"
+        return False
+
+    # channel_id sintético → tenta abrir DM do bot com o usuário como fallback.
     resolved = await asyncio.to_thread(resolve_dm_channel_id, recipient_discord_id)
     if resolved.success and resolved.channel_id:
         sent = await asyncio.to_thread(send_discord_message, resolved.channel_id, reply_text, None)
@@ -310,18 +330,7 @@ async def _try_auto_reply(watch: dict[str, Any]) -> bool:
     else:
         bot_error = resolved.error or ""
 
-    # Bot falhou por falta de servidor em comum (50278) → manda link OAuth via
-    # userbot no canal original da DM, para a pessoa autorizar o bot.
-    no_mutual_guilds = "50278" in bot_error or "mutual" in bot_error.lower()
-    if no_mutual_guilds:
-        oauth_sent = await asyncio.to_thread(send_via_userbot, channel_id, _oauth_invite_message())
-        if oauth_sent.success:
-            watch["auto_reply_blocked_reason"] = "oauth_link_enviado"
-            return False
-        watch["auto_reply_blocked_reason"] = f"falha ao enviar oauth via userbot: {oauth_sent.error}"
-    else:
-        watch["auto_reply_blocked_reason"] = f"falha ao enviar via bot: {bot_error}"
-
+    watch["auto_reply_blocked_reason"] = f"falha ao enviar via DM: {bot_error}"
     return False
 
 

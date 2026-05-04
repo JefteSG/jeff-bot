@@ -6,7 +6,7 @@ from typing import Any
 
 import discord
 
-from api.services.discord_outbound import notify_jeff, send_via_userbot
+from api.services.discord_outbound import notify_jeff, resolve_dm_channel_id, send_discord_message
 from api.services.llm import LLMReply, generate_reply
 from config import get_settings
 from bot.agent_sdk import run_agent_reply
@@ -17,6 +17,11 @@ try:
 except ModuleNotFoundError:
     from bot.watchdog import SENSITIVE_HINTS
     from bot.router import _append_context, _connect, _enqueue_pending, _ensure_sender, _open_jeff_relay, _is_wants_jeff, _is_urgent
+
+try:
+    from admin import handle_admin_message, is_admin
+except ModuleNotFoundError:
+    from bot.admin import handle_admin_message, is_admin
 
 
 # Estado para desambiguação multi-turn quando há múltiplos senders com nome similar
@@ -51,6 +56,24 @@ QUERY_KEYWORDS_LAST_MESSAGE = (
     "o que o",
     "o que a",
 )
+
+
+def _is_admin_command_content(raw_content: str) -> bool:
+    content = str(raw_content or "").strip()
+    if "/" in content and not content.startswith("/"):
+        first_slash = content.find("/")
+        prefix = content[:first_slash].strip()
+        if prefix.startswith("@") or prefix.startswith("<@"):
+            content = content[first_slash:].strip()
+
+    admin_commands = (
+        "/add-channel",
+        "/remove-channel",
+        "/channels",
+        "/senders",
+        "/mode",
+    )
+    return any(content.startswith(cmd) for cmd in admin_commands)
 
 
 def _detect_jeff_query(text: str) -> str | None:
@@ -503,8 +526,9 @@ async def _pop_jeff_relay() -> dict[str, Any] | None:
     try:
         rows = await conn.execute_fetchall(
             """
-            SELECT id, sender_id, user_channel_id
+            SELECT jr.id, jr.sender_id, jr.user_channel_id, s.discord_id AS sender_discord_id
             FROM jeff_relays
+            JOIN senders s ON s.id = jr.sender_id
             WHERE status = 'waiting'
             ORDER BY created_at ASC
             LIMIT 1
@@ -541,8 +565,12 @@ async def _handle_bot_dm(message: discord.Message) -> None:
     if settings.jeff_discord_id and sender_discord_id == settings.jeff_discord_id:
         relay = await _pop_jeff_relay()
         if relay:
-            sent = await asyncio.to_thread(send_via_userbot, relay["user_channel_id"], content)
-            ack = "Enviado!" if sent.success else f"Falha ao enviar: {sent.error}"
+            resolved = await asyncio.to_thread(resolve_dm_channel_id, str(relay.get("sender_discord_id") or ""))
+            if resolved.success and resolved.channel_id:
+                sent = await asyncio.to_thread(send_discord_message, resolved.channel_id, content)
+                ack = "Enviado!" if sent.success else f"Falha ao enviar: {sent.error}"
+            else:
+                ack = f"Falha ao abrir DM do bot para o usuario: {resolved.error}"
             await message.channel.send(ack)
             return
         # Sem relay pendente: Jeff pode estar fazendo queries sobre conversas ou testando.
@@ -667,26 +695,108 @@ async def _handle_bot_dm(message: discord.Message) -> None:
         await conn.close()
 
 
-async def _run_bot_client(token: str) -> None:
+async def _should_handle_server_message(message: discord.Message, client: discord.Client) -> tuple[bool, bool, bool]:
+    """Decide se o bot oficial deve processar a mensagem de servidor.
+
+    Retorna: (deve_processar, is_mentioned, in_discussion)
+    """
+    settings = get_settings()
+    client_user = getattr(client, "user", None)
+    live_bot_id = str(getattr(client_user, "id", "") or "")
+    cfg_bot_id = str(settings.discord_bot_user_id or "")
+    target_ids = {bot_id for bot_id in (live_bot_id, cfg_bot_id) if bot_id}
+
+    is_mentioned = False
+    for mentioned_user in (message.mentions or []):
+        mention_id = str(getattr(mentioned_user, "id", "") or "")
+        if mention_id and mention_id in target_ids:
+            is_mentioned = True
+            break
+
+    if not is_mentioned and target_ids:
+        content = str(message.content or "")
+        for bot_id in target_ids:
+            if f"<@{bot_id}>" in content or f"<@!{bot_id}>" in content:
+                is_mentioned = True
+                break
+
+    in_discussion = False
+    channel_id = str(getattr(message.channel, "id", "") or "")
+    if channel_id:
+        try:
+            from server import check_discussion_channel  # type: ignore
+        except ModuleNotFoundError:
+            from bot.server import check_discussion_channel  # import local para evitar ciclo no módulo
+
+        conn = await _connect()
+        try:
+            in_discussion = await check_discussion_channel(channel_id, conn)
+        finally:
+            await conn.close()
+
+    return (is_mentioned or in_discussion), is_mentioned, in_discussion
+
+
+async def _handle_bot_server_message(message: discord.Message, client: discord.Client) -> None:
+    """Processa mensagens em servidor no bot oficial (menção ou canal de discussão)."""
+    author_id = str(getattr(message.author, "id", "") or "")
+    if is_admin(author_id) and _is_admin_command_content(str(message.content or "")):
+        conn = await _connect()
+        try:
+            await handle_admin_message(message, client, conn)
+        finally:
+            await conn.close()
+        return
+
+    try:
+        from server import route_server_message  # type: ignore
+    except ModuleNotFoundError:
+        from bot.server import route_server_message  # import local para evitar ciclo no módulo
+
+    should_handle, is_mentioned, in_discussion = await _should_handle_server_message(message, client)
+    if not should_handle:
+        return
+
+    print(
+        "[official_bot] mensagem de servidor recebida",
+        {
+            "author": str(getattr(message.author, "id", "") or ""),
+            "channel": str(getattr(message.channel, "id", "") or ""),
+            "guild": str(getattr(message.guild, "id", "") or ""),
+            "mentioned": is_mentioned,
+            "discussion": in_discussion,
+        },
+    )
+    await route_server_message(message, client)
+
+
+async def _run_bot_client(token: str, *, enable_message_content: bool) -> None:
     intents = discord.Intents.default()
+    intents.guilds = True
+    intents.messages = True
     intents.dm_messages = True
+    intents.message_content = enable_message_content
     client = discord.Client(intents=intents)
 
     @client.event
     async def on_ready() -> None:
         user = client.user
-        print(f"[official_bot] conectado como {getattr(user, 'id', 'unknown')}")
+        print(
+            f"[official_bot] conectado como {getattr(user, 'id', 'unknown')} "
+            f"(message_content={enable_message_content})"
+        )
 
     @client.event
     async def on_message(message: discord.Message) -> None:
         if message.author.bot:
             return
-        if message.guild is not None:
-            return
         try:
-            await _handle_bot_dm(message)
+            if message.guild is None:
+                await _handle_bot_dm(message)
+            else:
+                await _handle_bot_server_message(message, client)
         except Exception as exc:
-            print(f"[official_bot] erro ao processar DM: {exc}")
+            print(f"[official_bot] erro ao processar mensagem: {exc}")
 
     await client.start(token)
 
@@ -699,8 +809,17 @@ def start_official_bot_listener() -> None:
 
     def _runner() -> None:
         try:
-            asyncio.run(_run_bot_client(settings.discord_bot_token))
+            asyncio.run(_run_bot_client(settings.discord_bot_token, enable_message_content=True))
         except Exception as exc:
+            msg = str(exc)
+            if "privileged intents" in msg.lower() or "message content" in msg.lower():
+                print("[official_bot] intent privilegiada indisponível; reiniciando sem message_content")
+                try:
+                    asyncio.run(_run_bot_client(settings.discord_bot_token, enable_message_content=False))
+                    return
+                except Exception as fallback_exc:
+                    print(f"[official_bot] listener encerrou com erro no fallback: {fallback_exc}")
+                    return
             print(f"[official_bot] listener encerrou com erro: {exc}")
 
     thread = threading.Thread(target=_runner, name="official-discord-bot", daemon=True)

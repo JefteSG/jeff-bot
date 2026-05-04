@@ -1,15 +1,31 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from api.routes import messages, knowledge, tasks
 from api.services.db import init_db
+from api.services.scheduler import MemoryScheduler
 from bot.router import route_payload
 
 
-app = FastAPI(title="Jeff Bot API", version="0.1.0")
+memory_scheduler = MemoryScheduler()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    memory_scheduler.start()
+    try:
+        yield
+    finally:
+        await memory_scheduler.stop()
+
+
+app = FastAPI(title="Jeff Bot API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,11 +49,6 @@ class IncomingMessagePayload(BaseModel):
     sender_discord_id: str = Field(min_length=1)
     sender_name: str = Field(default="")
     content: str = Field(min_length=1)
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    init_db()
 
 
 @app.get("/health")

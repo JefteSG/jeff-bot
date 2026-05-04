@@ -8,11 +8,56 @@ from urllib import request, error
 from config import get_settings
 
 
-SYSTEM_PROMPT = (
-    "You are Jeff, a technical assistant. "
-    "Tone: direct, concise, practical, low-formality. "
-    "Return short answers in pt-BR when user writes in pt-BR."
-)
+_PERSONALITY_PROMPTS: dict[str, str] = {
+    "jeff_direct": (
+        "You are Jeff, a technical assistant. "
+        "Tone: direct, concise, practical, low-formality. "
+        "Return short answers in pt-BR when user writes in pt-BR."
+    ),
+    "friendly_mentor": (
+        "You are Jeff, a technical assistant. "
+        "Tone: friendly and didactic, still concise and practical. "
+        "Explain quickly why a step matters when relevant, in pt-BR when user writes in pt-BR."
+    ),
+    "strict_sre": (
+        "You are Jeff, a technical assistant focused on operations reliability. "
+        "Tone: objective, risk-aware, and practical. "
+        "Prioritize safe diagnostics, explicit assumptions, and one clear next step. "
+        "Answer in pt-BR when user writes in pt-BR."
+    ),
+}
+
+_logged_personality = False
+
+
+def get_active_personality_name() -> str:
+    settings = get_settings()
+    configured = str(getattr(settings, "bot_personality", "") or "").strip().lower()
+    return configured if configured in _PERSONALITY_PROMPTS else "jeff_direct"
+
+
+def get_system_prompt() -> str:
+    settings = get_settings()
+    personality_name = get_active_personality_name()
+    base_prompt = _PERSONALITY_PROMPTS[personality_name]
+    custom = str(getattr(settings, "bot_personality_custom", "") or "").strip()
+    if custom:
+        return f"{base_prompt}\nAdditional persona instructions: {custom}"
+    return base_prompt
+
+
+def _log_personality_once() -> None:
+    global _logged_personality
+    if _logged_personality:
+        return
+    settings = get_settings()
+    personality_name = get_active_personality_name()
+    custom_enabled = bool(str(getattr(settings, "bot_personality_custom", "") or "").strip())
+    print(
+        f"[llm] personalidade ativa: {personality_name}"
+        f" (custom={'on' if custom_enabled else 'off'})"
+    )
+    _logged_personality = True
 
 TOOLS = [
     {
@@ -77,9 +122,10 @@ def _request_payload(
     user_message: str,
     history: list[dict[str, str]],
     image_urls: list[str] | None = None,
+    max_tokens: int | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": get_system_prompt()}]
     messages.extend(history)
 
     if image_urls and settings.vision_enabled:
@@ -93,13 +139,16 @@ def _request_payload(
             text = f"{user_message}\n[{len(image_urls)} print(s) de erro anexado(s) — visão desabilitada]"
         messages.append({"role": "user", "content": text})
 
-    return {
+    payload: dict[str, Any] = {
         "model": settings.deepseek_model,
         "messages": messages,
         "tools": TOOLS,
         "tool_choice": "auto",
         "temperature": 0.2,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    return payload
 
 
 def _fallback_reply(user_message: str) -> LLMReply:
@@ -115,13 +164,15 @@ def generate_reply(
     user_message: str,
     history: list[dict[str, str]] | None = None,
     image_urls: list[str] | None = None,
+    max_tokens: int | None = None,
 ) -> LLMReply:
     """Integração DeepSeek em formato compatível OpenAI Chat Completions."""
     settings = get_settings()
+    _log_personality_once()
     if not settings.deepseek_api_key:
         return _fallback_reply(user_message)
 
-    payload = _request_payload(user_message, history or [], image_urls)
+    payload = _request_payload(user_message, history or [], image_urls, max_tokens)
     url = f"{settings.deepseek_base_url.rstrip('/')}/chat/completions"
     req = request.Request(
         url=url,
