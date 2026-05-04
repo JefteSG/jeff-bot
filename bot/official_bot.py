@@ -9,11 +9,7 @@ import discord
 from api.services.discord_outbound import notify_jeff, send_via_userbot
 from api.services.llm import LLMReply, generate_reply
 from config import get_settings
-
-try:
-    from agent_sdk import run_agent_reply
-except ModuleNotFoundError:
-    from bot.agent_sdk import run_agent_reply
+from bot.agent_sdk import run_agent_reply
 
 try:
     from watchdog import SENSITIVE_HINTS
